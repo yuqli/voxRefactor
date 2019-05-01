@@ -24,15 +24,13 @@
 #include <boost/filesystem/operations.hpp>
 #include <boost/filesystem/path.hpp>
 #include <cuda.h>
-using namespace std;
+#include <ctime>
 
+using namespace std;
 
 #define index2(x, y, W) (x)*(W) + (y)  // used to index 2D objects in C style arrays; x is row and y is column
 #define index3(z, x, y, H, W)  ((z)*(H)*(W)) + (x)*(W) + (y)  // used to index 3D objects in C style arrays
 #define binvoxIndex3(z, x, y, H, W)  ((x)*(H)*(W)) + (z)*(W) + (y)  // used to index 3D objects in binvox voxels. needed as the coordinates are different
-
-
-using namespace std;
 
 typedef unsigned char byte;
 
@@ -41,11 +39,11 @@ static int D = 256;  // depth, also Z dim
 const int W = 256;  // width, also X dim
 const int H = 256;  // height, also Y dim
 static int size;
-static byte *voxels = 0;   // global variable to store voxels
+byte *voxels = 0;   // global variable to store voxels
 
 const int smallH = 64;  // small size cube
 static int smallSize;
-static byte *smallV = 0;   // global variable to store small voxels
+byte *smallV = 0;   // global variable to store small voxels
 static float tx, ty, tz;
 static float scale;
 static float thres=0.5;   // threshold: what's the proportion of data in the small cube that's filled should we set it filled?
@@ -58,6 +56,7 @@ int read_binvox(const string & filespec)
 
     ifstream *input = new ifstream(filespec.c_str(), ios::in | ios::binary);
     if ((*input).fail()){
+        cerr << "Error: " << strerror(errno) << endl;
         cout << "Error: file does not exist at " << filespec << "!" << endl;
     }
     //
@@ -67,11 +66,12 @@ int read_binvox(const string & filespec)
     *input >> line;  // #binvox
     if (line.compare("#binvox") != 0) {
         cout << "Error: first line reads [" << line << "] instead of [#binvox]" << endl;
+        input->close();
         delete input;
         return 0;
     }
     *input >> version;
-    cout << "reading binvox version " << version << endl;
+//    cout << "reading binvox version " << version << endl;
 
     int depth, height, width;  // values from file, compare if the same
     depth = -1;
@@ -106,13 +106,6 @@ int read_binvox(const string & filespec)
         return 0;
     }
 
-    size = W * H * D;
-    voxels = new byte[size];  // danger! not initialized!
-    if (!voxels) {
-        cout << "  error allocating memory" << endl;
-        return 0;
-    }
-
     //
     // read voxel data
     //
@@ -130,7 +123,11 @@ int read_binvox(const string & filespec)
 
         if (input->good()) {
             end_index = index + count;
-            if (end_index > size) return 0;
+            if (end_index > size) {
+                input->close();
+                delete input;
+                return 0;
+            }
             for(int i=index; i < end_index; i++) voxels[i] = value;
 
             if (value) nr_voxels += count;
@@ -140,10 +137,9 @@ int read_binvox(const string & filespec)
     }  // while
 
     input->close();
-    cout << "  read " << nr_voxels << " voxels" << endl;
-
+//    cout << "  read " << nr_voxels << " voxels" << endl;
+    delete input;
     return 1;
-
 }
 
 
@@ -172,11 +168,31 @@ vector<string> split(const char *phrase, string delimiter){
 }
 
 
+vector<string> read_file (string fpath){
+    vector<string> all;
+    string line;
+
+    ifstream myfile (fpath.c_str());
+    if (myfile.is_open())
+    {
+        while ( getline (myfile,line) )
+        {
+//            cout << line << '\n';
+            all.push_back(line);
+        }
+        myfile.close();
+    }
+
+    else cout << "Unable to open file";
+
+    return all;
+}
+
 
 int main(int argc, char **argv)
 {
-    if (argc != 4) {
-        cout << "Usage: v2d <cuda device> <binvox filename> <output root folder>" << endl << endl;
+    if (argc != 5) {
+        cout << "Usage: refactor <cuda device> <binvox catelog file> <input root folder> <output root folder>" << endl << endl;
         exit(1);
     }
 
@@ -192,67 +208,103 @@ int main(int argc, char **argv)
     else
         cudaSetDevice(device);
 
-    if (!read_binvox(argv[2])) {
-        cout << "Error reading [" << argv[2] << "]" << endl << endl;
+    vector<string> catelog = read_file(argv[2]);
+    if (catelog.empty()){
+        cout << "Error reading catelog at [" << argv[2] << "]" << endl << endl;
         exit(1);
     }
-
-    vector<string> all_inputs = split(argv[2], "/");
-    string bname = all_inputs.back();  // last element is file name "input.binvox"
-    string bid = split(bname.c_str(), ".").front();    // first element is building id
-    cout << "Building file name " << bname << endl;
-    cout << "Building name " << bid << endl;
-
-
-    smallSize = smallH * smallH * smallH;
-    // https://stackoverflow.com/questions/2204176/how-to-initialise-memory-with-new-operator-in-c
-    smallV = new byte[smallSize]();  // special syntax to initialize things to zero
-
-    float thres_sum = thres * 64;   // hard code here as we know small cube size already!!
-
-
-    //------------------------------------- CUDA code starts ----------------------------------------//
-    byte * d_v, * d_sv;  // voxels and small voxels on device
-
-    cudaMalloc(& d_v, size * sizeof(byte));
-    cudaMalloc(& d_sv, smallSize * sizeof(byte));
-
-    cudaMemcpy(d_v, voxels, size * sizeof(byte), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_sv, smallV, smallSize * sizeof(byte), cudaMemcpyHostToDevice);
-
-    // assigning CUDA blocks and dimensions
-    // a small voxel is 64**3, and needs 64**3 threads in total
-    // every thread can only take care of a small cube because it needs to sum over. a small cube is 4**3 = 64
-    // so the speed up is at least 64 times than a single thread, but GPUs are slower than CPU...
-    dim3 blocksPerGrid(4, 4, 16);   //
-    dim3 threadsPerBlock(16, 16, 4); // 1024 threads per block
-
-    // start kernel
-    fillKernel<<<blocksPerGrid, threadsPerBlock>>>(d_v, d_sv, smallH, thres_sum);
-
-    // check errors
-    cudaDeviceSynchronize();
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess)
-    {
-        cout << "Error: " << cudaGetErrorString(err) << endl;
-        exit(-1);
+    else {
+        cout << "Finished reading [" << catelog.size() << "] file names" << endl << endl;
     }
 
-    // copy results from device to host
-    cudaMemcpy(smallV, d_sv, smallSize * sizeof(byte), cudaMemcpyDeviceToHost);
+    int counter = 0;
+    std::clock_t start;
+    double duration;
+    start = std::clock();
 
-    //------------------------------------- CUDA code finish ----------------------------------------//
-    string out_dir = argv[3];
-    // https://stackoverflow.com/questions/5621944/how-to-find-out-if-a-folder-exists-and-how-to-create-a-folder
-    if (!boost::filesystem::exists(out_dir))
-        boost::filesystem::create_directories(out_dir);
-    string outname = out_dir+ "/" + bid + ".bin";
-    FILE* file = fopen(outname.c_str(), "wb" );
-    fwrite( smallV, sizeof(byte), smallSize, file );
+    size = W * H * D;
+    voxels = new byte[size];  // danger! not initialized!
+    if (!voxels) {
+        cout << "  error allocating memory" << endl;
+        return 0;
+    }
 
-    delete smallV;
+    for (vector<string>::iterator t = catelog.begin(); t != catelog.end(); ++t){
+        if (counter % 1000 == 0){
+            duration = ( std::clock() - start ) / (double) CLOCKS_PER_SEC;
+            std::cout << "File Count:\t" << counter << "\tElapsed time:\t" << duration << endl;
+        }
 
+        try {
+            string bid = split((*t).c_str(), ".").front();    // first element is building id
+//            cout << "Building name " << bid << endl;
+
+            // read binvox
+            string path = argv[3] + *t;
+            if (!read_binvox(path)){
+                cout << "Error reading [" << *t << "]" << endl << endl;
+                continue;
+            }
+            smallSize = smallH * smallH * smallH;
+            // https://stackoverflow.com/questions/2204176/how-to-initialise-memory-with-new-operator-in-c
+            smallV = new byte[smallSize]();  // special syntax to initialize things to zero
+
+            float thres_sum = thres * 64;   // hard code here as we know small cube size already!!
+
+            //------------------------------------- CUDA code starts ----------------------------------------//
+            byte * d_v, * d_sv;  // voxels and small voxels on device
+
+            cudaMalloc(& d_v, size * sizeof(byte));
+            cudaMalloc(& d_sv, smallSize * sizeof(byte));
+
+            cudaMemcpy(d_v, voxels, size * sizeof(byte), cudaMemcpyHostToDevice);
+            cudaMemcpy(d_sv, smallV, smallSize * sizeof(byte), cudaMemcpyHostToDevice);
+
+            // assigning CUDA blocks and dimensions
+            // a small voxel is 64**3, and needs 64**3 threads in total
+            // every thread can only take care of a small cube because it needs to sum over. a small cube is 4**3 = 64
+            // so the speed up is at least 64 times than a single thread, but GPUs are slower than CPU...
+            dim3 blocksPerGrid(4, 4, 16);   //
+            dim3 threadsPerBlock(16, 16, 4); // 1024 threads per block
+
+            // start kernel
+            fillKernel<<<blocksPerGrid, threadsPerBlock>>>(d_v, d_sv, smallH, thres_sum);
+
+            // check errors
+            cudaDeviceSynchronize();
+            cudaError_t err = cudaGetLastError();
+            if (err != cudaSuccess)
+            {
+                cout << "Error: " << cudaGetErrorString(err) << endl;
+                continue;
+            }
+
+            // copy results from device to host
+            cudaMemcpy(smallV, d_sv, smallSize * sizeof(byte), cudaMemcpyDeviceToHost);
+            cudaFree(d_sv);
+            cudaFree(d_v);
+            //------------------------------------- CUDA code finish ----------------------------------------//
+
+            string out_dir = argv[4];
+            // https://stackoverflow.com/questions/5621944/how-to-find-out-if-a-folder-exists-and-how-to-create-a-folder
+            if (!boost::filesystem::exists(out_dir))
+                boost::filesystem::create_directories(out_dir);
+            string outname = out_dir+ bid + ".bin";
+//          cout << outname << endl;
+            FILE* file = fopen(outname.c_str(), "wb" );
+            if (file!=NULL)
+            {
+                fwrite( smallV, sizeof(byte), smallSize, file );
+                fclose(file);
+//          cout << "Finished writing..." << endl;
+            }
+
+        }
+        catch (...){
+            continue;
+        }
+        counter++;
+    }    // end the for loop
     return 0;
 }
 
