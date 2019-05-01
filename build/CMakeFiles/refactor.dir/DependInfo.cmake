@@ -4,7 +4,7 @@ set(CMAKE_DEPENDS_LANGUAGES
   )
 # The set of files for implicit dependencies of each language:
 set(CMAKE_DEPENDS_CHECK_CUDA
-  "/media/yuqiong/DATA/voxRefactor/src/main.cu" "/media/yuqiong/DATA/voxRefactor/build/CMakeFiles/refactor.dir/main.cu.o"
+  "/data/voxRefactor/src/main.cu" "/data/voxRefactor/build/CMakeFiles/refactor.dir/main.cu.o"
   )
 set(CMAKE_CUDA_COMPILER_ID "NVIDIA")
 

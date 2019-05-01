@@ -6,7 +6,7 @@
 
 #IncludeRegexTransform: 
 
-/media/yuqiong/DATA/voxRefactor/src/main.cu
+/data/voxRefactor/src/main.cu
 string
 -
 fstream
